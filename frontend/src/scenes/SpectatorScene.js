@@ -1,19 +1,18 @@
 import Phaser from 'phaser';
 import { TILE, BLOCK } from '../config.js';
-import { getBlock } from '../world.js';
 import GameScene from './GameScene.js';
-import { GAME_MODES, createMatchForMode } from '../engine/index.js';
+import { GAME_MODES } from '../engine/index.js';
+import { RealtimeWorld } from '../engine/realtime.js';
 import { createSquad } from '../engine/agents.js';
 import { drawRobot as drawSharedRobot } from '../render/robot.js';
 import { btnCss, wireBtn } from './arenaUI.js';
 
-// Live spectator. Extends GameScene to REUSE the real game rendering — same
-// procedural tiles, ore, shop, robot models — at 1:1 TILE scale, but driven by
-// an engine match of scripted bots on a free-scroll camera. Adds dig-crack +
-// debris + dynamite FX so you can SEE blocks break and bombs go off, and a
-// speed control so the tempo reads like deliberate real-time mining.
-const BASE_TICK_MS = 280;       // deliberate pace (×speed below)
-const SPEEDS = [0.5, 1, 2];
+// Live spectator. Extends GameScene to REUSE the real game rendering (tiles,
+// ore, shop, robot models) at 1:1 scale, but drives a CONTINUOUS real-time
+// world (engine/realtime.js) — no ticks. Each character moves/digs/falls over
+// real durations with smooth interpolation; the agent is polled when its
+// character goes idle. Free-scroll camera; a speed control scales real time.
+const FUSE_MS = 4000; // must match realtime.js DYNAMITE_FUSE_MS (for the fuse animation)
 
 function squadCounts(n) {
   const kinds = ['shuttle', 'prospector', 'deepdiver', 'shuttle', 'prospector'];
@@ -35,39 +34,37 @@ export default class SpectatorScene extends GameScene {
     this.spectator = true;
     this.mode = GAME_MODES[this.specMode] || GAME_MODES['coop-gem'];
     this.bots = createSquad(squadCounts(this.mode.miners));
-    this.match = createMatchForMode(this.specMode, {
+    this.rt = new RealtimeWorld({
       seed: this.specSeed,
+      spec: this.mode.spec,
+      spawn: this.mode.spawn,
+      victory: this.mode.victory,
+      safeFall: 3, // same as single-player: a >3-tile fall hurts/kills
       miners: this.bots.map((b) => ({ name: b.name, hat: b.hat, color: b.color, items: b.items || undefined })),
     });
-    this.world = this.match.state.world;
+    this.rt.setAgents(this.bots.map((b) => b.decide));
+    this.world = this.rt.world;
 
-    // Render layers (depth-ordered). worldGfx/tilePool feed inherited drawWorld.
     this.worldGfx = this.add.graphics();
     this.digFxGfx = this.add.graphics(); this.digFxGfx.setDepth(3);
     this.debrisGfx = this.add.graphics(); this.debrisGfx.setDepth(4);
     this.robotGfx = this.add.graphics(); this.robotGfx.setDepth(5);
     this.fxGfx = this.add.graphics(); this.fxGfx.setDepth(6);
     this.tilePool = []; this.tilePoolCursor = 0;
-    this.fallingStones = [];
-    this.digging = null; this.failedDig = null;
-    this.debris = [];   // reused by inherited spawnDebris/updateDebris/drawDebris
-    this.flashes = [];  // explosion rings
+    this.fallingStones = []; this.digging = null; this.failedDig = null;
+    this.debris = []; this.flashes = [];
 
     const cam = this.cameras.main;
     cam.setBounds(0, 0, this.world.W * TILE, this.world.H * TILE);
     cam.setBackgroundColor('#4a7bbf');
     cam.setRoundPixels(true);
     cam.setZoom(1);
-    cam.centerOn(this.match.state.shopX * TILE, (this.world.surface + 7) * TILE);
+    cam.centerOn(this.rt.match.shopX * TILE, (this.world.surface + 7) * TILE);
 
     this.setupCameraControls();
-    this.specDraw = this.match.state.miners.map((m) => ({ px: m.tx, py: m.ty }));
-
-    this.speedIdx = 1;
-    this.tickMs = BASE_TICK_MS / SPEEDS[this.speedIdx];
-    this.buildHUD();
-    this.buildTimer();
+    this.statsTimer = 0;
     this.worldDirty = true;
+    this.buildHUD();
 
     this.scale.on('resize', this.onSpecResize, this);
     this.events.once('shutdown', () => this.teardown());
@@ -76,114 +73,96 @@ export default class SpectatorScene extends GameScene {
 
   onSpecResize() { this.scene.restart({ mode: this.specMode, seed: this.specSeed }); }
 
-  buildTimer() {
-    if (this.tickEvent) this.tickEvent.remove();
-    this.tickEvent = this.time.addEvent({ delay: this.tickMs, loop: true, callback: () => this.stepMatch() });
-  }
-
   setupCameraControls() {
-    // Fixed 1:1 zoom the whole time. Two ways to move the camera:
-    //  • drag with the mouse
-    //  • mouse wheel SCROLLS (pans) — vertical wheel = up/down, horizontal
-    //    wheel (or shift+wheel) = left/right. No zoom.
+    // Fixed 1:1 zoom. Drag or mouse-wheel to scroll (pan). No zoom.
     const cam = this.cameras.main;
     this.input.on('pointermove', (p) => {
       if (!p.isDown) return;
       cam.scrollX -= p.x - p.prevPosition.x;
       cam.scrollY -= p.y - p.prevPosition.y;
-      this.worldDirty = true;
     });
-    this.input.on('wheel', (_p, _o, dx, dy) => {
-      cam.scrollX += dx;
-      cam.scrollY += dy;
-      this.worldDirty = true;
-    });
-  }
-
-  stepMatch() {
-    if (this.match.finished) return;
-    const ms = this.match.state.miners;
-    // Snapshot in-progress digs so we can pop debris when a block breaks.
-    const wasBusy = ms.map((m) => (m.busy ? { tx: m.busy.tx, ty: m.busy.ty, type: m.busy.blockType } : null));
-
-    for (const id of this.match.minerIds) {
-      this.match.submitAction(id, this.bots[id].decide(this.match.observe(id)));
-    }
-    const events = this.match.advance();
-
-    // A dig that was running and is now gone, on a tile that is now empty,
-    // means the block just broke → burst of debris.
-    for (let i = 0; i < ms.length; i++) {
-      const pb = wasBusy[i];
-      const m = ms[i];
-      if (!pb) continue;
-      const stillSame = m.busy && m.busy.tx === pb.tx && m.busy.ty === pb.ty;
-      if (!stillSame && getBlock(this.world, pb.tx, pb.ty) === BLOCK.SKY) {
-        this.spawnDebris(pb.tx, pb.ty, pb.type, 10);
-      }
-    }
-    // Dynamite went off → flash + shake + rubble.
-    for (const e of events) {
-      if (e.type === 'detonation') {
-        this.flashes.push({ x: e.x, y: e.y, maxR: (e.radius + 1) * TILE, life: 320, maxLife: 320 });
-        this.spawnDebris(e.x, e.y, BLOCK.STONE, 18);
-        this.cameras.main.shake(170, 0.004 * (e.radius + 1));
-      }
-    }
-
-    this.worldDirty = true;
-    this.updateHUD();
-    if (this.match.finished) this.showFinish();
+    this.input.on('wheel', (_p, _o, dx, dy) => { cam.scrollX += dx; cam.scrollY += dy; });
   }
 
   update(time, dt) {
-    const k = Math.min(1, (dt / this.tickMs) * 1.7);
-    const ms = this.match.state.miners;
-    for (let i = 0; i < this.specDraw.length; i++) {
-      const m = ms[i], d = this.specDraw[i];
-      d.px += (m.tx - d.px) * k;
-      d.py += (m.ty - d.py) * k;
+    if (!this.rt.finished) {
+      // Advance real time (cap dt so a tab-stall doesn't teleport everyone).
+      this.rt.update(Math.min(50, dt));
+      for (const e of this.rt.events) {
+        if (e.type === 'dug') this.spawnDebris(e.x, e.y, e.block, 8);
+        else if (e.type === 'detonation') {
+          this.flashes.push({ x: e.x, y: e.y, maxR: (e.radius + 1) * TILE, life: 320, maxLife: 320 });
+          this.spawnDebris(e.x, e.y, BLOCK.STONE, 16);
+          this.cameras.main.shake(160, 0.004 * (e.radius + 1));
+        }
+      }
+      if (this.rt.worldDirty) { this.worldDirty = true; this.rt.worldDirty = false; }
     }
-    if (this.debris.length > 0) this.updateDebris(dt); // inherited physics
-    for (let i = this.flashes.length - 1; i >= 0; i--) {
-      this.flashes[i].life -= dt;
-      if (this.flashes[i].life <= 0) this.flashes.splice(i, 1);
-    }
+
+    // Feed the realtime falling stones into the inherited drawTile so they get
+    // the same wobble/jitter as single-player; keep redrawing while any wobble.
+    this.fallingStones = this.rt.stones.map((s) => ({ x: s.x, y: s.y, state: s.phase }));
+    if (this.rt.stones.length) this.worldDirty = true;
+
+    if (this.debris.length) this.updateDebris(dt);
+    for (let i = this.flashes.length - 1; i >= 0; i--) { this.flashes[i].life -= dt; if (this.flashes[i].life <= 0) this.flashes.splice(i, 1); }
 
     if (this.worldDirty) { this.drawWorld(); this.worldDirty = false; } // inherited — real tiles
     this.drawDigCracks();
     this.debrisGfx.clear();
-    if (this.debris.length > 0) this.drawDebris(); // inherited
+    if (this.debris.length) this.drawDebris();      // inherited
+    this._syncBombs();
+    this.drawBombs();                                // inherited — real dynamite sticks + fuses
     this.drawSpecRobots(time);
     this.drawFx(time);
+
+    this.statsTimer += dt;
+    if (this.statsTimer >= 200) { this.statsTimer = 0; this.updateHUD(); if (this.rt.finished) this.showFinish(); }
   }
 
   drawSpecRobots(time) {
     const g = this.robotGfx; g.clear();
-    const ms = this.match.state.miners;
-    for (let i = 0; i < ms.length; i++) {
-      const m = ms[i];
-      if (!m.alive) continue;
-      const d = this.specDraw[i];
-      drawSharedRobot(g, d.px * TILE + TILE / 2, d.py * TILE + TILE / 2, TILE, {
-        facing: m.facing,
-        digging: !!m.busy,
-        time,
-        hasDiamond: m.hasDiamond,
-        hat: m.hat,
-        bodyColor: m.color,
-        tier: 1,
+    for (const m of this.rt.s.miners) {
+      const dying = !m.alive && m.respawnAtMs != null; // show the squashed corpse until respawn
+      if (!m.alive && !dying) continue;
+      const digging = !!(m.act && m.act.kind === 'dig') && !dying;
+      // Same dig shake as single-player drawRobot.
+      const shake = digging
+        ? { x: (Math.floor(time / 55) % 2 === 0) ? 1 : -1, y: (Math.floor(time / 80) % 2 === 0) ? 1 : 0 }
+        : { x: 0, y: 0 };
+      drawSharedRobot(g, m.drawX * TILE + TILE / 2, m.drawY * TILE + TILE / 2, TILE, {
+        facing: m.facing, digging, time, hasDiamond: m.hasDiamond,
+        shake, squashed: dying, hat: m.hat, bodyColor: m.color, tier: 1,
       });
+      // Dust puffs around the dig target — identical to single-player.
+      if (digging) {
+        g.fillStyle(0x8b5a2b, 0.7);
+        const dx = m.act.tx * TILE + TILE / 2, dy = m.act.ty * TILE + TILE / 2;
+        for (let i = 0; i < 3; i++) {
+          const a = (time / 100 + i * 2) % 6.28;
+          const rr = 6 + (time / 50 + i * 7) % 14;
+          g.fillRect(Math.round(dx + Math.cos(a) * rr), Math.round(dy + Math.sin(a) * rr), 3, 3);
+        }
+      }
     }
   }
 
-  // Crack overlay + progress bar on every tile currently being drilled.
+  // Mirror the realtime bombs into GameScene's bomb format so the inherited
+  // drawBombs() renders the exact same dynamite stick + animated fuse.
+  _syncBombs() {
+    const now = this.time.now;
+    this.bombs = this.rt.bombs.map((b) => {
+      const elapsed = FUSE_MS - Math.max(0, b.fuseAt - this.rt.timeMs);
+      return { tx: b.x, ty: b.y, isBig: b.radius >= 2, fuse: FUSE_MS, placedAt: now - elapsed };
+    });
+  }
+
   drawDigCracks() {
     const g = this.digFxGfx; g.clear();
-    for (const m of this.match.state.miners) {
-      if (!m.alive || !m.busy) continue;
-      const { tx, ty, ticksLeft, totalTicks } = m.busy;
-      const progress = totalTicks ? 1 - ticksLeft / totalTicks : 0;
+    for (const m of this.rt.s.miners) {
+      if (!m.alive || !m.act || m.act.kind !== 'dig') continue;
+      const { tx, ty, t, dur } = m.act;
+      const progress = dur ? Math.min(1, t / dur) : 0;
       const px = tx * TILE, py = ty * TILE;
       g.lineStyle(3, 0x000000, 0.85);
       if (progress >= 0.25) {
@@ -194,29 +173,16 @@ export default class SpectatorScene extends GameScene {
         g.strokeLineShape(new Phaser.Geom.Line(px + TILE - 8, py + 6, px + TILE / 2 + 4, py + TILE / 2));
         g.strokeLineShape(new Phaser.Geom.Line(px + TILE / 2 - 2, py + TILE / 2 + 2, px + 10, py + TILE - 4));
       }
-      if (progress >= 0.75) {
-        g.strokeLineShape(new Phaser.Geom.Line(px + TILE / 2, py + 4, px + TILE / 2 + 3, py + TILE / 2));
-      }
+      if (progress >= 0.75) g.strokeLineShape(new Phaser.Geom.Line(px + TILE / 2, py + 4, px + TILE / 2 + 3, py + TILE / 2));
       g.fillStyle(0x000000, 0.55); g.fillRect(px + 3, py - 9, TILE - 6, 6);
       g.fillStyle(0xffdd55, 1); g.fillRect(px + 4, py - 8, (TILE - 8) * progress, 4);
     }
   }
 
-  drawFx(time) {
+  drawFx() {
     const g = this.fxGfx; g.clear();
-    // Live dynamite fuses (so you see one is about to blow).
-    for (const b of this.match.state.bombs) {
-      const cx = b.x * TILE + TILE / 2, cy = b.y * TILE + TILE / 2;
-      const pulse = 0.5 + 0.5 * Math.sin(time / 70);
-      g.fillStyle(0xff3b1f, 0.35 + 0.35 * pulse);
-      g.fillCircle(cx, cy, TILE * 0.45 * (0.6 + 0.4 * pulse));
-      g.fillStyle(0xffe14a, 1);
-      g.fillCircle(cx, cy - TILE * 0.32, 3 + 2 * pulse);
-    }
-    // Explosion rings.
     for (const f of this.flashes) {
-      const a = f.life / f.maxLife;
-      const r = 8 + f.maxR * (1 - a);
+      const a = f.life / f.maxLife; const r = 8 + f.maxR * (1 - a);
       const cx = f.x * TILE + TILE / 2, cy = f.y * TILE + TILE / 2;
       g.fillStyle(0xff7a1f, 0.25 * a); g.fillCircle(cx, cy, r);
       g.lineStyle(4, 0xffd14a, a); g.strokeCircle(cx, cy, r);
@@ -242,18 +208,6 @@ export default class SpectatorScene extends GameScene {
     title.textContent = this.mode.label;
     bar.appendChild(title);
 
-    const speed = wireBtn(document.createElement('button'));
-    speed.id = 'spec-speed';
-    speed.style.cssText = btnCss('#5fd0e6') + 'font-size:13px;padding:6px 12px;box-shadow:2px 2px 0 rgba(0,0,0,.35)';
-    speed.onclick = () => this.cycleSpeed();
-    bar.appendChild(speed);
-    this.speedEl = speed;
-
-    const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:12px;opacity:.6';
-    hint.textContent = 'drag or wheel to scroll';
-    bar.appendChild(hint);
-
     const stats = document.createElement('div');
     stats.id = 'spec-stats';
     stats.style.cssText = 'margin-left:auto;font-size:14px';
@@ -261,44 +215,31 @@ export default class SpectatorScene extends GameScene {
 
     document.body.appendChild(bar);
     this.statsEl = stats;
-    this.refreshSpeedLabel();
     this.updateHUD();
-  }
-
-  cycleSpeed() {
-    this.speedIdx = (this.speedIdx + 1) % SPEEDS.length;
-    this.tickMs = BASE_TICK_MS / SPEEDS[this.speedIdx];
-    this.buildTimer();
-    this.refreshSpeedLabel();
-  }
-
-  refreshSpeedLabel() {
-    if (this.speedEl) this.speedEl.textContent = `⏩ ${SPEEDS[this.speedIdx]}×`;
   }
 
   updateHUD() {
     if (!this.statsEl) return;
-    const s = this.match.state;
-    const alive = s.miners.filter((m) => m.alive).length;
-    const dug = s.miners.reduce((a, m) => a + m.stats.tilesDug, 0);
+    const ms = this.rt.s.miners;
+    const alive = ms.filter((m) => m.alive).length;
+    const dug = ms.reduce((a, m) => a + m.stats.tilesDug, 0);
     this.statsEl.innerHTML =
-      `tick <b>${s.tick}</b>　agents <b>${alive}/${s.miners.length}</b>　` +
-      `dug <b>${dug}</b>　team <b style="color:#ffec6e">$${s.teamScore}</b>` +
-      (s.diamondFound ? '　<b style="color:#5ff6ff">💎</b>' : '');
+      `${(this.rt.timeMs / 1000).toFixed(0)}s　agents <b>${alive}/${ms.length}</b>　` +
+      `dug <b>${dug}</b>　team <b style="color:#ffec6e">$${this.rt.teamScore}</b>` +
+      (this.rt.match.diamondFound ? '　<b style="color:#5ff6ff">💎</b>' : '');
   }
 
   showFinish() {
     if (document.getElementById('spec-finish')) return;
-    const s = this.match.state;
     const ov = document.createElement('div');
     ov.id = 'spec-finish';
     ov.style.cssText = `position:fixed;inset:0;z-index:22;display:flex;flex-direction:column;
       align-items:center;justify-content:center;gap:18px;background:#000a;
       font-family:'Courier New',monospace;color:#fff;text-align:center`;
-    const reason = s.finishedReason === 'diamond' ? '💎 DIAMOND DELIVERED'
-      : s.finishedReason === 'score_target' ? '🏁 SCORE TARGET REACHED' : '⏱ TIME UP';
+    const reason = this.rt.match.finishedReason === 'diamond' ? '💎 DIAMOND DELIVERED'
+      : this.rt.match.finishedReason === 'score_target' ? '🏁 SCORE TARGET REACHED' : '⏱ TIME UP';
     ov.innerHTML = `<div style="font-size:40px;font-weight:bold;color:#ffdd55;text-shadow:3px 3px 0 #000">${reason}</div>
-      <div style="font-size:22px">team score: <b style="color:#ffec6e">$${s.teamScore}</b></div>`;
+      <div style="font-size:22px">team score: <b style="color:#ffec6e">$${this.rt.teamScore}</b></div>`;
     const again = wireBtn(document.createElement('button'));
     again.textContent = '↺  LOBBY';
     again.style.cssText = btnCss('#5fd0e6') + 'font-size:18px;padding:12px 30px';
@@ -313,7 +254,6 @@ export default class SpectatorScene extends GameScene {
   }
 
   teardown() {
-    if (this.tickEvent) { this.tickEvent.remove(); this.tickEvent = null; }
     document.getElementById('spec-hud')?.remove();
     document.getElementById('spec-finish')?.remove();
   }
