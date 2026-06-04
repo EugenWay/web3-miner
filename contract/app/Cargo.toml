@@ -1,0 +1,16 @@
+[package]
+name = "robo-miner-profile-app"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Package containing business logic for the program"
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+parity-scale-codec = { version = "3.7.5", default-features = false, features = ["derive"] }
+sails-rs.workspace = true
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }

@@ -1,0 +1,25 @@
+{
+  "network": "vara-mainnet",
+  "rpc": "wss://rpc.vara.network",
+  "deployedAt": "2026-04-28T11:08:00Z",
+  "blockNumber": 32501999,
+  "deployer": "kGkbrEpV6JrGuVh7jRzMJXJUds7Vewy5mBFinEGAD63xa7mSb",
+  "programId": "0x59b572ac6135fef6fa5d1bdb2b365f1ad7b721bc7a620122065968a78c4fa1f1",
+  "codeId": "0xfc4464199c198dd2b03c98709f8a191ab8a95f2fc62c6dd875079ed0491097fc",
+  "deployTx": "0x18ffb7ff2f9f48e8e61ef55c0e8deab4f288cae34de5c608f8bd2a660b6f84b0",
+  "idlPath": "contract/robo-miner-profile/target/wasm32-gear/release/robo_miner_profile.idl",
+  "wasmPath": "contract/robo-miner-profile/target/wasm32-gear/release/robo_miner_profile.opt.wasm",
+  "interface": "v3 - voucher-only design, no value transfers, no pay_revive. Just submit_run + queries.",
+  "previousVersions": [
+    {
+      "programId": "0x723aadfb0e4ac581ab8f95a80adf1c3556521906011f58df68e958e79be8c3a0",
+      "deployedAt": "2026-04-28T10:50:00Z",
+      "note": "v2 — had pay_revive + revives counter, now obsolete"
+    },
+    {
+      "programId": "0xc68af33f1303093a42388c4bd76c90dd5dcf46530b757025c4886d4e9824292c",
+      "deployedAt": "2026-04-28T10:38:00Z",
+      "note": "v1 — sails-rs 1.0-beta IDL, sails-js incompatible"
+    }
+  ]
+}
